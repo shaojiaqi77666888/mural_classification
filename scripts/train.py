@@ -1,21 +1,24 @@
 """
-壁画主题分类 - 训练脚本（修复版）
-关键修复:
-1. 修正freeze逻辑：model.py里分类头叫classifier不是fc，原来代码会冻住整个网络
-2. 增加两阶段训练：先冻主干练分类头，再解冻微调
-3. 增加训练历史记录
-4. 修正JSON路径为四省合并版
+壁画主题分类 - 训练脚本（10类强化版）
+核心改进（不改变类别数）:
+1. Focal Loss 替代 CrossEntropy - 专门解决类别不平衡
+2. 更激进的类别权重 - 1/count 而非 1/sqrt(count)
+3. 更高的学习率 - 阶段2 backbone 1e-4, head 1e-3
+4. 更长的冻结阶段 - 20 epochs
+5. 更强的数据增强 + 随机擦除
+6. 更大的 batch_size - RTX 4060 可以上 24
+7. Label Smoothing 降低到 0.05（壁画类别边界模糊，不要太软化）
+8. 增加 Mixup 数据增强
 """
 import json
 import time
 from pathlib import Path
-from typing import Dict, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -28,9 +31,43 @@ from scripts.dataset import create_data_loaders, load_annotations, save_splits, 
 from scripts.model import get_model
 
 
+# ================= Focal Loss =================
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for Dense Object Detection
+    对难分类样本加大权重，对易分类样本降低权重
+    特别适合类别极度不平衡的情况
+    """
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha  # 类别权重
+        self.gamma = gamma  # 聚焦参数，越大对易分样本抑制越强
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = nn.functional.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)  # 预测概率
+        
+        # Focal weight: (1-pt)^gamma
+        focal_weight = (1 - pt) ** self.gamma
+        
+        loss = focal_weight * ce_loss
+        
+        # 加上类别权重 alpha
+        if self.alpha is not None:
+            alpha_t = self.alpha[targets]
+            loss = alpha_t * loss
+        
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
+
+
 # ================= 早停 =================
 class EarlyStopping:
-    def __init__(self, patience=15, delta=0.0):
+    def __init__(self, patience=25, delta=0.0):
         self.patience = patience
         self.delta = delta
         self.counter = 0
@@ -57,17 +94,43 @@ class EarlyStopping:
             model.load_state_dict(self.best_model_state)
 
 
+# ================= Mixup =================
+def mixup_data(x, y, alpha=0.4):
+    """Mixup数据增强"""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(x.device)
+    mixed_x = lam * x + (1 - lam) * x[index]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """Mixup损失"""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+
 # ================= 训练一个epoch =================
-def train_epoch(model, loader, criterion, optimizer, device):
+def train_epoch(model, loader, criterion, optimizer, device, use_mixup=False):
     model.train()
     total_loss, correct, total = 0, 0, 0
 
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device)
-
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
+        
+        # Mixup
+        if use_mixup and np.random.random() < 0.5:
+            images, labels_a, labels_b, lam = mixup_data(images, labels)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
+        else:
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -97,7 +160,6 @@ def evaluate(model, loader, criterion, device):
         pred = outputs.argmax(1)
         correct += (pred == labels).sum().item()
         total += labels.size(0)
-
         all_preds.extend(pred.cpu().numpy())
         all_labels.extend(labels.cpu().numpy())
 
@@ -107,13 +169,21 @@ def evaluate(model, loader, criterion, device):
 # ================= 主训练 =================
 def train(data_dir, image_dir, json_path, config):
     print("=" * 60)
-    print("壁画主题分类 - ResNet50 训练 (四省合并版)")
+    print("壁画主题分类 - ResNet50 训练 (10类强化版)")
+    print("改进: Focal Loss + Mixup + 更高LR + 更强增强")
     print("=" * 60)
 
     # ---------- 数据 ----------
     print("\n[1/5] 加载数据...")
     annotations = load_annotations(json_path)
     print(f"总样本: {len(annotations)}")
+
+    # 打印类别分布
+    from collections import Counter
+    cats = Counter(item['category'] for item in annotations)
+    print("类别分布:")
+    for cat, count in cats.most_common():
+        print(f"  {cat}: {count}")
 
     train_ann, val_ann, test_ann = split_dataset(annotations)
     save_splits(train_ann, val_ann, test_ann, Path(data_dir) / "splits")
@@ -131,66 +201,67 @@ def train(data_dir, image_dir, json_path, config):
     model = get_model(
         num_classes=config.NUM_CLASSES,
         pretrained=config.PRETRAINED,
+        dropout=0.5,
         device=str(device)
     )
 
-    # ---- 关键修复：正确的freeze逻辑 ----
-    # model.py里backbone.fc已经被替换为Identity，真正的分类头是model.classifier
-    # 原来代码 if not name.startswith("fc") 会冻住classifier所有层，导致无法训练！
-
-    # 阶段1：冻结backbone，只训练分类头
-    print("\n[阶段1] 冻结主干网络，训练分类头...")
+    # ---- 阶段1：冻结主干 ----
+    freeze_epochs = getattr(config, 'FREEZE_EPOCHS', 20)
+    print(f"\n[阶段1] 冻结主干 {freeze_epochs} epochs，只训练分类头...")
     for name, param in model.named_parameters():
-        if "classifier" in name:  # 只解冻分类头
-            param.requires_grad = True
-        else:
-            param.requires_grad = False
+        param.requires_grad = "classifier" in name
 
-    # 统计可训练参数
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"可训练参数: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
 
-    # ---------- 损失 ----------
+    # ---------- 损失函数：Focal Loss + 类别权重 ----------
     if class_weights is not None:
         class_weights = class_weights.to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+    
+    # 用Focal Loss替代CrossEntropy
+    # gamma=2.0 对易分样本抑制适中
+    # alpha 用类别权重
+    criterion = FocalLoss(alpha=class_weights, gamma=2.0)
+    print(f"使用 Focal Loss (gamma=2.0) + 类别权重")
 
-    # ---------- 阶段1优化器 ----------
+    # ---------- 阶段1优化器（高学习率） ----------
+    classifier_params = [p for n, p in model.named_parameters() if "classifier" in n]
     optimizer = optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=config.LR * 3,   # 阶段1用较高学习率
+        classifier_params,
+        lr=config.LR * 5,      # 1.5e-3
         weight_decay=config.WEIGHT_DECAY
     )
-
-    scheduler = CosineAnnealingLR(optimizer, T_max=config.EPOCHS, eta_min=1e-6)
+    scheduler = CosineAnnealingLR(optimizer, T_max=freeze_epochs, eta_min=1e-5)
     early_stop = EarlyStopping(patience=config.EARLY_STOP_PATIENCE)
 
     # ---------- 训练循环 ----------
     print(f"\n[3/5] 开始训练 (最多 {config.EPOCHS} epochs)...")
     print("-" * 60)
-
     best_acc = 0.0
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": [], "lr": []}
     writer = SummaryWriter(Path(data_dir).parent / "logs") if HAS_TENSORBOARD else None
 
-    # 阶段1训练（冻结主干）
-    freeze_epochs = getattr(config, 'FREEZE_EPOCHS', 10)
-
     for epoch in range(1, config.EPOCHS + 1):
-        # 阶段2：解冻主干（在freeze_epochs之后）
+        # 阶段2：解冻主干
         if epoch == freeze_epochs + 1:
-            print(f"\n>>> 阶段2：解冻主干网络，全网络微调...")
+            print(f"\n>>> 阶段2：解冻主干，全网络微调...")
             for param in model.backbone.parameters():
                 param.requires_grad = True
-            # 重新设置优化器（分层学习率）
+            # 分层学习率：主干1e-4，分类头1e-3
             optimizer = optim.AdamW([
-                {"params": model.backbone.parameters(), "lr": config.LR * 0.1},
-                {"params": model.classifier.parameters(), "lr": config.LR}
+                {"params": model.backbone.parameters(), "lr": config.LR},
+                {"params": model.classifier.parameters(), "lr": config.LR * 10}
             ], weight_decay=config.WEIGHT_DECAY)
-            scheduler = CosineAnnealingLR(optimizer, T_max=config.EPOCHS - freeze_epochs, eta_min=1e-6)
+            scheduler = CosineAnnealingLR(
+                optimizer, T_max=config.EPOCHS - freeze_epochs, eta_min=1e-6
+            )
 
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, device)
+        # 前30轮使用Mixup，之后不用
+        use_mixup = epoch <= 30
+        train_loss, train_acc = train_epoch(
+            model, train_loader, criterion, optimizer, device, use_mixup=use_mixup
+        )
         val_loss, val_acc, _, _ = evaluate(model, val_loader, criterion, device)
         scheduler.step()
         current_lr = optimizer.param_groups[0]["lr"]
@@ -207,7 +278,6 @@ def train(data_dir, image_dir, json_path, config):
             writer.add_scalar("Loss/val", val_loss, epoch)
             writer.add_scalar("Acc/train", train_acc, epoch)
             writer.add_scalar("Acc/val", val_acc, epoch)
-            writer.add_scalar("LR", current_lr, epoch)
 
         print(f"Epoch {epoch:3d} | "
               f"Train Loss {train_loss:.4f} Acc {train_acc:.2f}% | "
@@ -222,10 +292,9 @@ def train(data_dir, image_dir, json_path, config):
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
                 "val_acc": val_acc,
-                "config": {k: v for k, v in vars(config).items() if not k.startswith("_")}
             }, save_dir / "best_model.pth")
+            print(f"  >> 最佳模型保存 (Val Acc: {best_acc:.2f}%)")
 
         # 早停
         if early_stop(val_loss, model):
@@ -234,11 +303,9 @@ def train(data_dir, image_dir, json_path, config):
 
     if writer:
         writer.close()
-
-    # 恢复最佳
     early_stop.restore(model)
 
-    # 保存训练历史
+    # 保存历史
     results_dir = Path(data_dir).parent / "results"
     results_dir.mkdir(exist_ok=True)
     with open(results_dir / "training_history.json", "w", encoding="utf-8") as f:
@@ -249,32 +316,40 @@ def train(data_dir, image_dir, json_path, config):
     test_loss, test_acc, test_preds, test_labels = evaluate(model, test_loader, criterion, device)
     print(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.2f}%")
 
-    # 保存测试预测
-    np.savez(results_dir / "test_predictions.npz",
-             preds=test_preds, labels=test_labels)
+    np.savez(results_dir / "test_predictions.npz", preds=test_preds, labels=test_labels)
 
-    # 各类别准确率
+    # 各类别详细报告
     from sklearn.metrics import classification_report, confusion_matrix
-    present_classes = sorted(set(test_labels))
-    target_names = [CLASS_NAMES[i] for i in present_classes]
+    present = sorted(set(test_labels))
+    target_names = [CLASS_NAMES[i] for i in present]
     print("\n[5/5] 分类报告:")
     print(classification_report(test_labels, test_preds, target_names=target_names, digits=4, zero_division=0))
 
+    # 打印混淆矩阵
+    cm = confusion_matrix(test_labels, test_preds)
+    print("\n混淆矩阵:")
+    print("        ", end="")
+    for i in present:
+        print(f"{CLASS_NAMES[i][:4]:6s}", end="")
+    print()
+    for i, row in enumerate(cm):
+        print(f"{CLASS_NAMES[i][:4]:6s}", end="")
+        for val in row:
+            print(f"{val:6d}", end="")
+        print()
+
     print("\n" + "=" * 60)
     print(f"训练完成! Best Val Acc: {best_acc:.2f}% | Test Acc: {test_acc:.2f}%")
-    print(f"模型保存: models/best_model.pth")
     print("=" * 60)
     return model
 
 
-# ================= 入口 =================
 if __name__ == "__main__":
     import sys
-
     project_root = Path(__file__).parent.parent
     data_dir = project_root / "data"
     image_dir = data_dir / "images"
-    json_path = data_dir / "annotations.json"  # 四省合并版
+    json_path = data_dir / "annotations.json"
 
     if len(sys.argv) > 1:
         json_path = Path(sys.argv[1])

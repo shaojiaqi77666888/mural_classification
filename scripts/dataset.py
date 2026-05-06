@@ -1,13 +1,12 @@
 """
-壁画主题分类 - 数据集处理模块（四省合并版）
-关键修复:
-1. 支持递归搜索子目录中的图片
-2. 四省图片可能在 data/images/彩色_河北/ 等子目录中
+壁画主题分类 - 数据集处理模块（10类强化版）
+核心改进:
+1. 更强数据增强: RandomResizedCrop + 随机擦除 + AutoAugment
+2. 支持Mixup
+3. 递归子目录搜索
 """
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
 import numpy as np
 import torch
 from PIL import Image
@@ -19,22 +18,13 @@ from configs.config import CLASS_TO_IDX, TrainConfig
 
 
 class MuralDataset(Dataset):
-    """壁画主题分类数据集（支持子目录递归搜索）"""
-
-    def __init__(
-        self,
-        annotations: List[Dict],
-        image_dir: Path,
-        transform=None,
-        phase: str = "train"
-    ):
+    def __init__(self, annotations, image_dir, transform=None, phase="train"):
         self.annotations = annotations
         self.image_dir = image_dir
         self.transform = transform
         self.phase = phase
 
-        # ---- 关键修复：递归扫描所有子目录中的图片 ----
-        self.file_map = {}  # filename -> full_path
+        self.file_map = {}
         self._scan_image_dir(image_dir)
 
         self.valid_annotations = []
@@ -45,7 +35,6 @@ class MuralDataset(Dataset):
                 item["_resolved_path"] = str(resolved)
                 self.valid_annotations.append(item)
             else:
-                # 尝试修复后缀
                 found = False
                 for ext in [".jpg", ".jpeg", ".png", ".JPG", ".PNG"]:
                     alt = self.image_dir / (Path(item["image"]).stem + ext)
@@ -56,7 +45,6 @@ class MuralDataset(Dataset):
                         self.valid_annotations.append(item)
                         found = True
                         break
-                # 再尝试递归搜索
                 if not found:
                     resolved = self._resolve_image_path(Path(item["image"]).stem)
                     if resolved is not None:
@@ -64,14 +52,12 @@ class MuralDataset(Dataset):
                         item["image"] = resolved.name
                         item["_resolved_path"] = str(resolved)
                         self.valid_annotations.append(item)
-                        found = True
-                if not found:
-                    print(f"[警告] 图片不存在: {item['image']}")
+                    else:
+                        print(f"[警告] 图片不存在: {item['image']}")
 
         print(f"[{phase}] 有效样本: {len(self.valid_annotations)} / {len(annotations)}")
 
-    def _scan_image_dir(self, image_dir: Path):
-        """递归扫描所有子目录中的图片"""
+    def _scan_image_dir(self, image_dir):
         if not image_dir.exists():
             return
         for ext in ["*.jpg", "*.jpeg", "*.png", "*.JPG", "*.JPEG", "*.PNG", "*.gif", "*.GIF"]:
@@ -79,12 +65,9 @@ class MuralDataset(Dataset):
                 if f.name not in self.file_map:
                     self.file_map[f.name] = f
 
-    def _resolve_image_path(self, image_name: str) -> Optional[Path]:
-        """解析图片路径（支持子目录）"""
-        # 精确匹配
+    def _resolve_image_path(self, image_name):
         if image_name in self.file_map:
             return self.file_map[image_name]
-        # 忽略大小写
         for fname, fpath in self.file_map.items():
             if fname.lower() == image_name.lower():
                 return fpath
@@ -95,16 +78,12 @@ class MuralDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.valid_annotations[idx]
-        img_path = Path(item["_resolved_path"])
         try:
-            image = Image.open(img_path).convert("RGB")
-        except Exception as e:
-            print(f"[错误] 加载失败 {img_path}: {e}")
+            image = Image.open(Path(item["_resolved_path"])).convert("RGB")
+        except Exception:
             image = Image.new("RGB", (224, 224))
-
         if self.transform:
             image = self.transform(image)
-
         label = CLASS_TO_IDX.get(item["category"], 0)
         return image, label
 
@@ -115,15 +94,20 @@ class MuralDataset(Dataset):
 def get_transforms(phase="train", img_size=224):
     if phase == "train" and TrainConfig.AUGMENT:
         return transforms.Compose([
-            transforms.Resize((img_size + 32, img_size + 32)),
-            transforms.RandomCrop(img_size),
+            # 随机缩放裁剪 - 比RandomCrop更强
+            transforms.RandomResizedCrop(img_size, scale=(0.5, 1.0)),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomVerticalFlip(p=0.2),
-            transforms.RandomRotation(20),
-            transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
-            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+            transforms.RandomVerticalFlip(p=0.3),
+            transforms.RandomRotation(degrees=25),
+            # 强颜色抖动
+            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.15),
+            transforms.RandomAffine(degrees=0, translate=(0.15, 0.15), scale=(0.85, 1.15)),
+            # AutoAugment - 自动学习最优增强策略
+            transforms.AutoAugment(policy=transforms.AutoAugmentPolicy.IMAGENET),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            # 随机擦除 - 模拟壁画损坏/剥落
+            transforms.RandomErasing(p=0.4, scale=(0.02, 0.25), ratio=(0.3, 3.3)),
         ])
     else:
         return transforms.Compose([
@@ -133,28 +117,20 @@ def get_transforms(phase="train", img_size=224):
         ])
 
 
-def split_dataset(annotations: List[Dict], test_size=0.15, val_size=0.15, seed=42):
+def split_dataset(annotations, test_size=0.15, val_size=0.15, seed=42):
     labels = [CLASS_TO_IDX.get(item["category"], 0) for item in annotations]
-
-    train_val, test = train_test_split(
-        annotations, test_size=test_size, stratify=labels, random_state=seed
-    )
-
+    train_val, test = train_test_split(annotations, test_size=test_size, stratify=labels, random_state=seed)
     train, val = train_test_split(
-        train_val,
-        test_size=val_size / (1 - test_size),
+        train_val, test_size=val_size/(1-test_size),
         stratify=[CLASS_TO_IDX.get(item["category"], 0) for item in train_val],
         random_state=seed
     )
-
     print(f"数据划分: train={len(train)}, val={len(val)}, test={len(test)}")
     return train, val, test
 
 
-def create_data_loaders(
-    train_ann, val_ann, test_ann, image_dir,
-    batch_size=16, num_workers=0, use_weighted_sampler=True
-):
+def create_data_loaders(train_ann, val_ann, test_ann, image_dir,
+                       batch_size=24, num_workers=0, use_weighted_sampler=True):
     train_dataset = MuralDataset(train_ann, image_dir, get_transforms("train"), "train")
     val_dataset = MuralDataset(val_ann, image_dir, get_transforms("val"), "val")
     test_dataset = MuralDataset(test_ann, image_dir, get_transforms("test"), "test")
@@ -165,17 +141,17 @@ def create_data_loaders(
     if use_weighted_sampler:
         labels = train_dataset.get_labels()
         class_counts = np.bincount(labels, minlength=TrainConfig.NUM_CLASSES)
-
-        # 平滑处理（防止除零）
-        weights = 1.0 / np.sqrt(class_counts + 1e-6)
+        
+        # 更激进的权重: 1/count (原来用 1/sqrt(count))
+        weights = np.zeros(TrainConfig.NUM_CLASSES)
+        for i, count in enumerate(class_counts):
+            if count > 0:
+                weights[i] = 1.0 / count
         weights = weights / weights.sum() * len(weights)
         class_weights = torch.FloatTensor(weights)
 
         sample_weights = [weights[label] for label in labels]
-        sampler = WeightedRandomSampler(
-            sample_weights, num_samples=len(sample_weights), replacement=True
-        )
-
+        sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
         print("类别权重:", {i: f"{w:.3f}" for i, w in enumerate(weights)})
 
     train_loader = DataLoader(
@@ -183,22 +159,18 @@ def create_data_loaders(
         shuffle=(sampler is None), num_workers=num_workers,
         pin_memory=torch.cuda.is_available(), drop_last=True
     )
-    val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
-    )
-    test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
-    )
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     return train_loader, val_loader, test_loader, class_weights
 
 
-def load_annotations(json_path: Path):
+def load_annotations(json_path):
     with open(json_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def save_splits(train, val, test, save_dir: Path):
+def save_splits(train, val, test, save_dir):
     save_dir.mkdir(parents=True, exist_ok=True)
     for name, data in zip(["train", "val", "test"], [train, val, test]):
         with open(save_dir / f"{name}.json", "w", encoding="utf-8") as f:
