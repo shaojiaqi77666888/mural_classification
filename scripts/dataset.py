@@ -95,12 +95,12 @@ def get_transforms(phase="train", img_size=448):
     if phase == "train" and TrainConfig.AUGMENT:
         return transforms.Compose([
             # 随机缩放裁剪 - 比RandomCrop更强
-            transforms.RandomResizedCrop(img_size, scale=(0.5, 1.0)),
+            transforms.RandomResizedCrop(img_size, scale=(0.7, 1.0)),
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomVerticalFlip(p=0.3),
             transforms.RandomRotation(degrees=25),
             # 强颜色抖动
-            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.15),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.15),
             transforms.RandomAffine(degrees=0, translate=(0.15, 0.15), scale=(0.85, 1.15)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),

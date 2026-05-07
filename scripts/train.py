@@ -136,10 +136,10 @@ def train_epoch(model, loader, criterion, optimizer, device, use_mixup=False):
         
         # Mixup
         if use_mixup and np.random.random() < 0.5:
-            images, labels_a, labels_b, lam = mixup_data(images, labels)
+            images, labels_a, labels_b, lam = cutmix_data(images, labels)
             optimizer.zero_grad()
             outputs = model(images)
-            loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
+            loss = cutmix_criterion(criterion, outputs, labels_a, labels_b, lam)
         else:
             optimizer.zero_grad()
             outputs = model(images)
@@ -213,10 +213,11 @@ def train(data_dir, image_dir, json_path, config):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"设备: {device}")
 
+    dropout = getattr(config, 'DROPOUT', 0.7)
     model = get_model(
         num_classes=config.NUM_CLASSES,
         pretrained=config.PRETRAINED,
-        dropout=0.5,
+        dropout=dropout,  # ← 加上这行
         device=str(device)
     )
 
