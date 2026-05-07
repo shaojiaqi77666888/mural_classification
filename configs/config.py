@@ -23,19 +23,20 @@ RESULTS_DIR = PROJECT_ROOT / "results"
 
 class TrainConfig:
     IMG_SIZE = 224
-    BATCH_SIZE = 24            # ← RTX 4060 可以上24
+    BATCH_SIZE = 12            # ← RTX 4060 可以上24
     NUM_WORKERS = 4
     
     NUM_CLASSES = 10             # ← 保持10类不变
     BACKBONE = "resnet50"
     PRETRAINED = True
+    DROPOUT = 0.7
     
     EPOCHS = 150
-    LR = 3e-4                    # ← 提高3倍
-    WEIGHT_DECAY = 1e-4
+    LR = 1e-4                    # ← 提高3倍
+    WEIGHT_DECAY = 5e-4
     EARLY_STOP_PATIENCE = 25     # ← 更耐心的早停
     
-    FREEZE_EPOCHS = 20           # ← 冻结更久
+    FREEZE_EPOCHS = 5           # ← 冻结更久
     
     LR_SCHEDULER = "cosine"
     AUGMENT = True

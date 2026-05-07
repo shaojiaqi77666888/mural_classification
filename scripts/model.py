@@ -105,10 +105,15 @@ def get_model(
     device: str = "cuda"
 ) -> ResNet50Classifier:
     """获取模型实例"""
+    try:
+        from configs.config import TrainConfig
+        dropout_cfg = getattr(TrainConfig, 'DROPOUT', dropout)
+    except:
+        dropout_cfg = dropout
     model = ResNet50Classifier(
         num_classes=num_classes,
         pretrained=pretrained,
-        dropout=dropout
+        dropout=dropout_cfg
     )
     
     if device == "cuda" and torch.cuda.is_available():

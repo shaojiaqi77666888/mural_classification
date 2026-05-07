@@ -91,7 +91,7 @@ class MuralDataset(Dataset):
         return [CLASS_TO_IDX.get(item["category"], 0) for item in self.valid_annotations]
 
 
-def get_transforms(phase="train", img_size=224):
+def get_transforms(phase="train", img_size=448):
     if phase == "train" and TrainConfig.AUGMENT:
         return transforms.Compose([
             # 随机缩放裁剪 - 比RandomCrop更强
@@ -102,8 +102,6 @@ def get_transforms(phase="train", img_size=224):
             # 强颜色抖动
             transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3, hue=0.15),
             transforms.RandomAffine(degrees=0, translate=(0.15, 0.15), scale=(0.85, 1.15)),
-            # AutoAugment - 自动学习最优增强策略
-            transforms.AutoAugment(policy=transforms.AutoAugmentPolicy.IMAGENET),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             # 随机擦除 - 模拟壁画损坏/剥落
@@ -130,10 +128,11 @@ def split_dataset(annotations, test_size=0.15, val_size=0.15, seed=42):
 
 
 def create_data_loaders(train_ann, val_ann, test_ann, image_dir,
-                       batch_size=24, num_workers=0, use_weighted_sampler=True):
-    train_dataset = MuralDataset(train_ann, image_dir, get_transforms("train"), "train")
-    val_dataset = MuralDataset(val_ann, image_dir, get_transforms("val"), "val")
-    test_dataset = MuralDataset(test_ann, image_dir, get_transforms("test"), "test")
+                       batch_size=12, num_workers=0, use_weighted_sampler=True,
+                       img_size=448):
+    train_dataset = MuralDataset(train_ann, image_dir, get_transforms("train", img_size), "train")
+    val_dataset = MuralDataset(val_ann, image_dir, get_transforms("val", img_size), "val")
+    test_dataset = MuralDataset(test_ann, image_dir, get_transforms("test", img_size), "test")
 
     sampler = None
     class_weights = None

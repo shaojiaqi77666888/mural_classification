@@ -74,8 +74,8 @@ class EarlyStopping:
         self.best_score = None
         self.best_model_state = None
 
-    def __call__(self, val_loss, model):
-        score = -val_loss
+    def __call__(self, val_acc, model):
+        score = val_acc
         if self.best_score is None:
             self.best_score = score
             self.best_model_state = model.state_dict().copy()
@@ -94,22 +94,35 @@ class EarlyStopping:
             model.load_state_dict(self.best_model_state)
 
 
-# ================= Mixup =================
-def mixup_data(x, y, alpha=0.4):
-    """Mixup数据增强"""
+# ================= CutMix =================
+def rand_bbox(size, lam):
+    W = size[2]
+    H = size[3]
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+    return bbx1, bby1, bbx2, bby2
+
+def cutmix_data(x, y, alpha=1.0):
     if alpha > 0:
         lam = np.random.beta(alpha, alpha)
     else:
         lam = 1
     batch_size = x.size(0)
     index = torch.randperm(batch_size).to(x.device)
-    mixed_x = lam * x + (1 - lam) * x[index]
     y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
+    bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
+    x[:, :, bbx1:bbx2, bby1:bby2] = x[index, :, bbx1:bbx2, bby1:bby2]
+    lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size()[-1] * x.size()[-2]))
+    return x, y_a, y_b, lam
 
-
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    """Mixup损失"""
+def cutmix_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
@@ -188,9 +201,11 @@ def train(data_dir, image_dir, json_path, config):
     train_ann, val_ann, test_ann = split_dataset(annotations)
     save_splits(train_ann, val_ann, test_ann, Path(data_dir) / "splits")
 
+    img_size = getattr(config, 'IMG_SIZE', 448)  # ← 加这行
     train_loader, val_loader, test_loader, class_weights = create_data_loaders(
         train_ann, val_ann, test_ann, image_dir,
-        batch_size=config.BATCH_SIZE, num_workers=config.NUM_WORKERS
+        batch_size=config.BATCH_SIZE, num_workers=config.NUM_WORKERS,
+        img_size=img_size  # ← 加这个参数
     )
 
     # ---------- 模型 ----------
@@ -297,7 +312,7 @@ def train(data_dir, image_dir, json_path, config):
             print(f"  >> 最佳模型保存 (Val Acc: {best_acc:.2f}%)")
 
         # 早停
-        if early_stop(val_loss, model):
+        if early_stop(val_acc, model):
             print(f"\n早停触发 (patience={config.EARLY_STOP_PATIENCE})")
             break
 
